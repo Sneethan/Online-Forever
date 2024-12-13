@@ -64,15 +64,38 @@ class DiscordClient:
             self.session = aiohttp.ClientSession()
             
         try:
-            payload = {"global_name": new_name}
+            headers = {
+                **self.headers,
+                "accept": "*/*",
+                "accept-language": "en-GB,en;q=0.9",
+                "priority": "u=1, i",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+                "x-debug-options": "bugReporterEnabled",
+                "x-discord-locale": "en-GB",
+                "x-discord-timezone": "Australia/Sydney",
+                "x-super-properties": "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6ImVuLUdCIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzEzMS4wLjAuMCBTYWZhcmkvNTM3LjM2IEVkZy8xMzEuMC4wLjAiLCJicm93c2VyX3ZlcnNpb24iOiIxMzEuMC4wLjAiLCJvc192ZXJzaW9uIjoiMTAifQ=="
+            }
+            
+            payload = {
+                "global_name": new_name
+            }
+            
             async with self.session.patch(
                 f"{API_BASE_URL}/users/@me",
-                headers=self.headers,
+                headers=headers,
                 json=payload
             ) as response:
+                if response.status == 400:
+                    error_data = await response.json()
+                    print(f"{Fore.WHITE}[{Fore.RED}-{Fore.WHITE}] Failed to update display name: {error_data.get('message', 'Unknown error')}")
+                    return False
+                    
                 response.raise_for_status()
                 print(f"{Fore.WHITE}[{Fore.LIGHTGREEN_EX}+{Fore.WHITE}] Display name updated to {Fore.LIGHTBLUE_EX}{new_name}{Fore.WHITE}!")
                 return True
+                
         except aiohttp.ClientError as e:
             print(f"{Fore.WHITE}[{Fore.RED}-{Fore.WHITE}] Failed to update display name: {str(e)}")
             return False
@@ -181,16 +204,25 @@ async def main():
     os.system("cls" if platform.system() == "Windows" else "clear")
 
     async with DiscordClient(token) as client:
+        # First validate token and get user info
         if not await client.validate_token():
             return
-
-        # Update display name
-        await client.update_display_name(Config.DISPLAY_NAME)
 
         print(f"{Fore.WHITE}[{Fore.LIGHTGREEN_EX}+{Fore.WHITE}] Logged in as "
               f"{Fore.LIGHTBLUE_EX}{client.user_info['username']}"
               f"{Fore.WHITE}({client.user_info['id']})!")
 
+        # Wait a short moment to ensure we're fully logged in
+        await asyncio.sleep(1)
+
+        # Then attempt to update display name
+        if Config.DISPLAY_NAME:
+            if await client.update_display_name(Config.DISPLAY_NAME):
+                print(f"{Fore.WHITE}[{Fore.LIGHTGREEN_EX}+{Fore.WHITE}] Successfully updated display name!")
+            else:
+                print(f"{Fore.WHITE}[{Fore.YELLOW}!{Fore.WHITE}] Continuing without updating display name...")
+
+        # Finally start presence maintenance
         await client.maintain_presence(Config.STATUS, Config.CUSTOM_STATUS)
 
 if __name__ == "__main__":
