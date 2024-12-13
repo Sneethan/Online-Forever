@@ -3,42 +3,145 @@ import sys
 import json
 import asyncio
 import platform
+from typing import Literal, Optional, Dict, Any
+
 import requests
 import websockets
+import aiohttp
+import backoff
 from colorama import init, Fore
+from dotenv import load_dotenv
+
+from config import Config
 from keep_alive import keep_alive
 
 init(autoreset=True)
+load_dotenv()
 
-status = "online"  # online/dnd/idle
-custom_status = "youtube.com/@SealedSaucer"  # Custom Status
+# Constants
+API_BASE_URL = "https://discord.com/api/v9"
+GATEWAY_URL = "wss://gateway.discord.gg/?v=9&encoding=json"
+STATUS_TYPES = Literal["online", "dnd", "idle"]
 
-usertoken = os.getenv("TOKEN")
-if not usertoken:
-    print(f"{Fore.WHITE}[{Fore.RED}-{Fore.WHITE}] Please add a token inside Secrets.")
-    sys.exit()
+class DiscordClient:
+    def __init__(self, token: str):
+        self.token = token
+        self.headers = {
+            "Authorization": token,
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        self.user_info: Optional[Dict[str, Any]] = None
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.heartbeat_interval: Optional[float] = None
+        self.last_sequence: Optional[int] = None
 
-headers = {"Authorization": usertoken, "Content-Type": "application/json"}
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
 
-validate = requests.get("https://canary.discordapp.com/api/v9/users/@me", headers=headers)
-if validate.status_code != 200:
-    print(f"{Fore.WHITE}[{Fore.RED}-{Fore.WHITE}] Your token might be invalid. Please check it again.")
-    sys.exit()
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
 
-userinfo = requests.get("https://canary.discordapp.com/api/v9/users/@me", headers=headers).json()
-username = userinfo["username"]
-discriminator = userinfo["discriminator"]
-userid = userinfo["id"]
+    @backoff.on_exception(backoff.expo, aiohttp.ClientError, max_tries=5)
+    async def validate_token(self) -> bool:
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+            
+        try:
+            async with self.session.get(f"{API_BASE_URL}/users/@me", headers=self.headers) as response:
+                response.raise_for_status()
+                self.user_info = await response.json()
+                return True
+        except aiohttp.ClientError as e:
+            print(f"{Fore.WHITE}[{Fore.RED}-{Fore.WHITE}] Token validation failed: {str(e)}")
+            return False
 
-async def onliner(token, status):
-    async with websockets.connect("wss://gateway.discord.gg/?v=9&encoding=json") as ws:
-        start = json.loads(await ws.recv())
-        heartbeat = start["d"]["heartbeat_interval"]
+    @backoff.on_exception(backoff.expo, aiohttp.ClientError, max_tries=3)
+    async def update_display_name(self, new_name: str) -> bool:
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+            
+        try:
+            payload = {"global_name": new_name}
+            async with self.session.patch(
+                f"{API_BASE_URL}/users/@me",
+                headers=self.headers,
+                json=payload
+            ) as response:
+                response.raise_for_status()
+                print(f"{Fore.WHITE}[{Fore.LIGHTGREEN_EX}+{Fore.WHITE}] Display name updated to {Fore.LIGHTBLUE_EX}{new_name}{Fore.WHITE}!")
+                return True
+        except aiohttp.ClientError as e:
+            print(f"{Fore.WHITE}[{Fore.RED}-{Fore.WHITE}] Failed to update display name: {str(e)}")
+            return False
 
+    async def maintain_presence(self, status: STATUS_TYPES, custom_status: str):
+        retry_count = 0
+        max_retries = 5
+        
+        while retry_count < max_retries:
+            try:
+                async with websockets.connect(GATEWAY_URL) as ws:
+                    payload = json.loads(await ws.recv())
+                    self.heartbeat_interval = payload["d"]["heartbeat_interval"] / 1000
+                    
+                    # Handle identification
+                    await self._send_auth(ws, status)
+                    await self._send_custom_status(ws, status, custom_status)
+                    
+                    # Start heartbeat in separate task
+                    heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
+                    
+                    try:
+                        while True:
+                            msg = await ws.recv()
+                            data = json.loads(msg)
+                            
+                            if data["op"] == 11:  # Heartbeat ACK
+                                continue
+                            
+                            if data["op"] == 7:  # Reconnect
+                                break
+                                
+                            if data["s"] is not None:
+                                self.last_sequence = data["s"]
+                                
+                    except websockets.ConnectionClosed:
+                        print(f"{Fore.WHITE}[{Fore.YELLOW}!{Fore.WHITE}] Connection closed, attempting to reconnect...")
+                        
+                    finally:
+                        heartbeat_task.cancel()
+                        
+            except Exception as e:
+                retry_count += 1
+                wait_time = min(retry_count * 5, 30)
+                print(f"{Fore.WHITE}[{Fore.RED}-{Fore.WHITE}] Connection error: {str(e)}")
+                print(f"{Fore.WHITE}[{Fore.YELLOW}!{Fore.WHITE}] Retrying in {wait_time} seconds...")
+                await asyncio.sleep(wait_time)
+        
+        print(f"{Fore.WHITE}[{Fore.RED}-{Fore.WHITE}] Max retries reached. Exiting...")
+
+    async def _heartbeat_loop(self, ws):
+        try:
+            while True:
+                await self._send_heartbeat(ws)
+                await asyncio.sleep(self.heartbeat_interval)
+        except asyncio.CancelledError:
+            pass
+
+    async def _send_heartbeat(self, ws):
+        await ws.send(json.dumps({
+            "op": 1,
+            "d": self.last_sequence
+        }))
+
+    async def _send_auth(self, ws, status: STATUS_TYPES):
         auth = {
             "op": 2,
             "d": {
-                "token": token,
+                "token": self.token,
                 "properties": {
                     "$os": "Windows 10",
                     "$browser": "Google Chrome",
@@ -49,7 +152,8 @@ async def onliner(token, status):
         }
         await ws.send(json.dumps(auth))
 
-        cstatus = {
+    async def _send_custom_status(self, ws, status: STATUS_TYPES, custom_status: str):
+        payload = {
             "op": 3,
             "d": {
                 "since": 0,
@@ -59,33 +163,41 @@ async def onliner(token, status):
                         "state": custom_status,
                         "name": "Custom Status",
                         "id": "custom",
-                                #Uncomment the below lines if you want an emoji in the status
-                                #"emoji": {
-                                    #"name": "emoji name",
-                                    #"id": "emoji id",
-                                    #"animated": False,
-                                #},
-                            }
-                        ],
+                    }
+                ],
                 "status": status,
                 "afk": False,
             },
         }
-        await ws.send(json.dumps(cstatus))
+        await ws.send(json.dumps(payload))
 
-        online = {"op": 1, "d": "None"}
-        await asyncio.sleep(heartbeat / 1000)
-        await ws.send(json.dumps(online))
+async def main():
+    token = os.getenv("TOKEN")
+    if not token:
+        print(f"{Fore.WHITE}[{Fore.RED}-{Fore.WHITE}] Please add a token inside Secrets.")
+        return
 
-async def run_onliner():
-    if platform.system() == "Windows":
-        os.system("cls")
-    else:
-        os.system("clear")
-    print(f"{Fore.WHITE}[{Fore.LIGHTGREEN_EX}+{Fore.WHITE}] Logged in as {Fore.LIGHTBLUE_EX}{username} {Fore.WHITE}({userid})!")
-    while True:
-        await onliner(usertoken, status)
-        await asyncio.sleep(50)
+    # Clear screen
+    os.system("cls" if platform.system() == "Windows" else "clear")
 
-keep_alive()
-asyncio.run(run_onliner())
+    async with DiscordClient(token) as client:
+        if not await client.validate_token():
+            return
+
+        # Update display name
+        await client.update_display_name(Config.DISPLAY_NAME)
+
+        print(f"{Fore.WHITE}[{Fore.LIGHTGREEN_EX}+{Fore.WHITE}] Logged in as "
+              f"{Fore.LIGHTBLUE_EX}{client.user_info['username']}"
+              f"{Fore.WHITE}({client.user_info['id']})!")
+
+        await client.maintain_presence(Config.STATUS, Config.CUSTOM_STATUS)
+
+if __name__ == "__main__":
+    keep_alive()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print(f"\n{Fore.WHITE}[{Fore.YELLOW}!{Fore.WHITE}] Shutting down...")
+    except Exception as e:
+        print(f"{Fore.WHITE}[{Fore.RED}-{Fore.WHITE}] Fatal error: {str(e)}")
